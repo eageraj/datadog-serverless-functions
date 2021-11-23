@@ -5,6 +5,7 @@ The Datadog Forwarder is an AWS Lambda function that ships logs, custom metrics,
 - Forward CloudWatch, ELB, S3, CloudTrail, VPC, SNS, and CloudFront logs to Datadog
 - Forward S3 events to Datadog
 - Forward Kinesis data stream events to Datadog (only CloudWatch logs are supported)
+- Forward Cloudwatch logs delivered to S3 by Kinesis Firehose (only Cloudwatch logs are supported)
 - Forward custom metrics from AWS Lambda functions using CloudWatch logs
 - Forward traces from AWS Lambda functions using CloudWatch logs
 - Generate and submit enhanced Lambda metrics (`aws.lambda.enhanced.*`) parsed from the AWS REPORT log: duration, billed_duration, max_memory_used, timeouts, out_of_memory, and estimated_cost

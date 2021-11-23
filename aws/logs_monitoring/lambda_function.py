@@ -44,6 +44,7 @@ from settings import (
     DD_HOST,
     DD_FORWARDER_VERSION,
     DD_ADDITIONAL_TARGET_LAMBDAS,
+    DD_MY_ACCOUNT,
 )
 
 
@@ -82,6 +83,10 @@ HOST_IDENTITY_REGEXP = re.compile(
 
 def datadog_forwarder(event, context):
     """The actual lambda function entry point"""
+
+    global DD_MY_ACCOUNT
+    DD_MY_ACCOUNT = context.invoked_function_arn.split(":")[4]
+
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"Received Event:{json.dumps(event)}")
         logger.debug(f"Forwarder version: {DD_FORWARDER_VERSION}")

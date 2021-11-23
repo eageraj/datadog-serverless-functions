@@ -20,6 +20,7 @@ from parsing import (
     parse_event_source,
     separate_security_hub_findings,
     parse_aws_waf_logs,
+    firehose_awslogs_handler,
 )
 
 env_patch.stop()
@@ -717,6 +718,102 @@ class TestAWSLogsHandler(unittest.TestCase):
             metadata,
         )
 
+    def test_firehose_cloudwatch_log(self):
+        log_event1 = {
+            "id": "36467307160539209801351731232590515947105281385400238080",
+            "timestamp": 1635250608708,
+            "message": "START RequestId: d885ae5c-0d40-4acc-b86a-bb9c54bcab58 Version: $LATEST\n",
+        }
+
+        log_event2 = {
+            "id": "36467307160539209801351731232590515947105281385400238080",
+            "timestamp": 1635250608708,
+            "message": "2021-10-26 12:16:48,709\td885ae5c-0d40-4acc-b86a-bb9c54bcab58\tDEBUG\tThis is a debug level message\n"
+        }
+
+        log_event3 = {
+            "id": "36467307160539209801351731232590515947105281385400238080",
+            "timestamp": 1635250608708,
+            "message": "2021-10-26 12:16:48,709\td885ae5c-0d40-4acc-b86a-bb9c54bcab58\tINFO\tThis is an info level message\n"
+        }
+
+        aws_element = {
+            'aws': {
+                'awslogs': {
+                    'logGroup': '/aws/lambda/lambda-test',
+                    'logStream': '2021/10/26/[$LATEST]d2c46e8935de4114b3f3c5de09f143a9',
+                    'owner': '1234567890'
+                }
+            }
+        }
+
+        lambda_element = {
+            'lambda': {
+                "arn": "arn:aws:lambda:ap-southeast-2:1234567890:function:lambda-test"
+            }
+        }
+
+        expected = dict()
+        expected[0] = {**log_event1, **aws_element, **lambda_element}
+        expected[1] = {**log_event2, **aws_element, **lambda_element}
+        expected[2] = {**log_event3, **aws_element, **lambda_element}
+
+        # A firehose delivered cloudwatch log containing log payload
+        firehose_cloudwatch_data_log = {
+            "messageType": "DATA_MESSAGE",
+            "owner": "1234567890",
+            "logGroup": "/aws/lambda/lambda-test",
+            "logStream": "2021/10/26/[$LATEST]d2c46e8935de4114b3f3c5de09f143a9",
+            "subscriptionFilters": [
+                "firehose_test"
+            ],
+            "logEvents": [
+                    log_event1, log_event2, log_event3
+            ]
+        }
+
+        # A firehose control message (which we should be ignoring)
+        firehose_control_message = {
+            "messageType": "CTL_MESSAGE",
+            "owner": "1234567890",
+            "something": "else"
+        }
+
+        context_json = {
+            "invoked_function_arn": "arn:aws:lambda:ap-southeast-2:1234567890:function:lambda_test",
+            "function_version" : "$LATEST",
+            "function_name" : "lambda-function",
+            "memory_limit_in_mb": 1024
+
+        }
+
+        # Construct a bunch of logs concatenated in the way firehose does...
+        # This will test that we're removing control messages and also splitting json properly
+        data=""
+        expected_log_count=0
+        for x in range(0,10):
+            if (x%3 ==0):
+                data = data + json.dumps(firehose_control_message)
+            else:
+                data = data + json.dumps(firehose_cloudwatch_data_log)
+                expected_log_count = expected_log_count+3
+
+        event = None
+        context =  type('new', (object,), context_json)
+        metadata = {"ddsource": "lambda", "ddtags": "env:dev"}
+
+        logs_iterable = firehose_awslogs_handler(event, context, metadata, data)
+        x=0
+        logs = dict()
+        for log in logs_iterable:
+            logs[x] = log
+            x = x+1
+
+        self.assertEqual(len(logs), expected_log_count)
+        for x in range(0, expected_log_count, 3):
+            self.assertEqual(logs[x], expected[0])
+            self.assertEqual(logs[x+1], expected[1])
+            self.assertEqual(logs[x+2], expected[2])
 
 if __name__ == "__main__":
     unittest.main()

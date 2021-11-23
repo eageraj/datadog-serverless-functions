@@ -40,6 +40,10 @@ Parameters:
     Type: Number
     Default: 300
     Description: TTL (in seconds) for the Datadog tags cache
+  DdCrossAccountGetTagsRoleName:
+    Type: String
+    Default: ""
+    Description: The role name to use when fetching tag names across accounts
   ReservedConcurrency:
     Type: Number
     Default: 100
@@ -133,6 +137,14 @@ Parameters:
     Type: String
     Default: ""
     Description: Only send logs matching the supplied regular expression and not excluded by ExcludeAtMatch. Note, using inefficient regular expression, such as `.*`, may slow down the Lambda function.
+  DdLogRedactRegex:
+    Type: String
+    Default: ""
+    Description: Pattern to match for message redaction. The first capture group will be retained and followed by DdRedactLogReplacement. e.g., "\S*\s?\S*\s?\S+\s+DEBUG|TRACE|FINE|FINER|FINEST\s+"
+  DdLogRedactReplacement:
+    Type: String
+    Default: ""
+    Description: String to replace the non matching part of the message when DdLogRedactRegex matches. For e.g., "Log Redacted"
   DdMultilineLogRegexPattern:
     Type: String
     Default: ""
@@ -206,6 +218,10 @@ Parameters:
     Type: String
     Default: ""
     Description: The endpoint URL to forward the traces to, useful for forwarding traces through a proxy
+  FirehoseSubscriptionNames:
+    Type: String
+    Default: ""
+    Description: A colon separated list of log subscription names to be searched when using a Firehose delivered (compressed) log from a cloudwatch subscription. If empty, logs delivered by Firehose will not be processed.
 Conditions:
   IsAWSChina:
     Fn::Equals:
@@ -281,6 +297,21 @@ Conditions:
       - Fn::Equals:
           - Ref: DdScrubbingRuleReplacement
           - ""
+  SetDdLogRedactRegex:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: DdLogRedactRegex
+          - ""
+  SetDdLogRedactReplacement:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: DdLogRedactReplacement
+          - ""
+  SetFirehoseSubscriptionNames:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: FirehoseSubscriptionNames
+          - ""
   SetExcludeAtMatch:
     Fn::Not:
       - Fn::Equals:
@@ -304,6 +335,10 @@ Conditions:
     Fn::Equals:
       - Ref: DdFetchLambdaTags
       - true
+  SetDdCrossAccountGetTagsRoleName:
+    Fn::Equals:
+      - Ref: DdCrossAccountGetTagsRoleName
+      - ""
   SetDdUsePrivateLink:
     Fn::Equals:
       - Ref: DdUsePrivateLink
@@ -464,6 +499,11 @@ Resources:
               - SetDdFetchLambdaTags
               - Ref: DdFetchLambdaTags
               - Ref: AWS::NoValue
+          DD_GET_TAGS_ROLENAME:
+            Fn::If:
+              - SetDdCrossAccountGetTagsRoleName
+              - Ref: DdCrossAccountGetTagsRoleName
+              - Ref: AWS::NoValue
           DD_USE_TCP:
             Fn::If:
               - SetDdUseTcp
@@ -504,6 +544,7 @@ Resources:
               - SetDdScrubbingRuleReplacement
               - Ref: DdScrubbingRuleReplacement
               - Ref: AWS::NoValue
+
           EXCLUDE_AT_MATCH:
             Fn::If:
               - SetExcludeAtMatch
@@ -513,6 +554,21 @@ Resources:
             Fn::If:
               - SetIncludeAtMatch
               - Ref: IncludeAtMatch
+              - Ref: AWS::NoValue
+          DD_LOG_REDACT_REGEX:
+            Fn::If:
+              - SetDdLogRedactRegex
+              - Ref: DdLogRedactRegex
+              - Ref: AWS::NoValue
+          DD_LOG_REDACT_REPLACEMENT:
+            Fn::If:
+              - SetDdLogRedactReplacement
+              - Ref: DdLogRedactReplacement
+              - Ref: AWS::NoValue
+          DD_FIREHOSE_SUBSCRIPTIONS:
+            Fn::If:
+              - SetFirehoseSubscriptionNames
+              - Ref: FirehoseSubscriptionNames
               - Ref: AWS::NoValue
           DD_MULTILINE_LOG_REGEX_PATTERN:
             Fn::If:
@@ -983,6 +1039,8 @@ Metadata:
           - RedactEmail
           - DdScrubbingRule
           - DdScrubbingRuleReplacement
+          - DdLogRedactRegex
+          - DdLogRedactReplacement
       - Label:
           default: Log Filtering (Optional)
         Parameters:
@@ -993,6 +1051,8 @@ Metadata:
         Parameters:
           - DdFetchLambdaTags
           - TagsCacheTTLSeconds
+          - DdCrossAccountGetTagsRoleName
+          - FirehoseSubscriptionNames
           - SourceZipUrl
           - InstallAsLayer
           - LayerARN

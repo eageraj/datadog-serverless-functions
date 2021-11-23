@@ -5,9 +5,11 @@
 
 import base64
 import gzip
+import io
 import json
 import os
 import copy
+from json import JSONDecodeError
 
 import boto3
 import botocore
@@ -32,8 +34,10 @@ from settings import (
     DD_HOST,
     DD_FORWARDER_VERSION,
     DD_USE_VPC,
+    DD_LOG_REDACT_REGEX,
+    DD_FIREHOSE_SUBSCRIPTIONS,
+    DD_LOG_REDACT_REPLACEMENT,
 )
-
 
 logger = logging.getLogger()
 
@@ -52,12 +56,41 @@ if DD_MULTILINE_LOG_REGEX_PATTERN:
         "^{}".format(DD_MULTILINE_LOG_REGEX_PATTERN)
     )
 
+if DD_LOG_REDACT_REGEX:
+    try:
+        log_redact_regex = re.compile("^({})".format(DD_LOG_REDACT_REGEX), re.I)
+    except Exception:
+        raise Exception(
+            "could not compile allowed log regex with pattern: {}".format(
+                DD_LOG_REDACT_REGEX)
+        )
+
 rds_regex = re.compile("/aws/rds/(instance|cluster)/(?P<host>[^/]+)/(?P<name>[^/]+)")
 
 cloudtrail_regex = re.compile(
     "\d+_CloudTrail_\w{2}-\w{4,9}-\d_\d{8}T\d{4}Z.+.json.gz$", re.I
 )
 
+##
+# Unzip and decode a file (only if it's a gzip file, in which case it will have a magic header 0x1f, 0x8b)
+# Note: In some cases, we may have a file that is gzipped twice.
+#  Eg: cloudwatch logs which are already gzipped delivered to a firehose then to an s3 gzipped again
+# So, we unzip and decode zero or more times
+# TODO: Handle other compression methods
+##
+def unzipData(data):
+    # Decompress data that has a .gz extension or magic header http://www.onicos.com/staff/iz/formats/gzip.html
+    if data[:2] == b"\x1f\x8b":
+        with gzip.GzipFile(fileobj=BytesIO(data)) as decompress_stream:
+            # Reading line by line avoid a bug where gzip would take a very long time (>5min) for
+            # file around 60MB gzipped
+            data = b"".join(BufferedReader(decompress_stream))
+        data = unzipData(data)
+
+    if hasattr(data, "decode"):
+        data = data.decode("utf-8", errors="ignore")
+
+    return data
 
 def parse(event, context):
     """Parse Lambda input to normalized events"""
@@ -69,7 +102,14 @@ def parse(event, context):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"Parsed event type: {event_type}")
         if event_type == "s3":
-            events = s3_handler(event, context, metadata)
+            event = transform_sns_event(event)
+            data = extract_s3_object(event)
+
+            if is_firehose_log(data):
+                events = firehose_awslogs_handler(event, context, metadata, data)
+            else:
+                events = s3_handler(event, context, metadata, data)
+
         elif event_type == "awslogs":
             events = awslogs_handler(event, context, metadata)
         elif event_type == "events":
@@ -146,9 +186,14 @@ def parse_event_type(event):
         return "events"
     raise Exception("Event type not supported (see #Event supported section)")
 
+def transform_sns_event(event):
+    # if this is a S3 event carried in a SNS message, extract it and override the event
+    if "Sns" in event["Records"][0]:
+        event = json.loads(event["Records"][0]["Sns"]["Message"])
+    return event
 
-# Handle S3 events
-def s3_handler(event, context, metadata):
+# Extract and decode an S3 object
+def extract_s3_object(event):
     # Need to use path style to access s3 via VPC Endpoints
     # https://github.com/gford1000-aws/lambda_s3_access_using_vpc_endpoint#boto3-specific-notes
     if DD_USE_VPC:
@@ -159,35 +204,32 @@ def s3_handler(event, context, metadata):
         )
     else:
         s3 = boto3.client("s3")
-    # if this is a S3 event carried in a SNS message, extract it and override the event
-    if "Sns" in event["Records"][0]:
-        event = json.loads(event["Records"][0]["Sns"]["Message"])
 
+    # Get the object from the event
+    bucket = event["Records"][0]["s3"]["bucket"]["name"]
+    key = urllib.parse.unquote_plus(event["Records"][0]["s3"]["object"]["key"])
+
+    response = s3.get_object(Bucket=bucket, Key=key)
+    body = response["Body"]
+    data = body.read()
+
+    data = unzipData(data)
+    return data
+
+# Handle S3 events
+def s3_handler(event, context, metadata, data):
     # Get the object from the event and show its content type
     bucket = event["Records"][0]["s3"]["bucket"]["name"]
     key = urllib.parse.unquote_plus(event["Records"][0]["s3"]["object"]["key"])
 
     source = parse_event_source(event, key)
     metadata[DD_SOURCE] = source
-
     metadata[DD_SERVICE] = get_service_from_tags(metadata)
 
     ##Get the ARN of the service and set it as the hostname
     hostname = parse_service_arn(source, key, bucket, context)
     if hostname:
         metadata[DD_HOST] = hostname
-
-    # Extract the S3 object
-    response = s3.get_object(Bucket=bucket, Key=key)
-    body = response["Body"]
-    data = body.read()
-
-    # Decompress data that has a .gz extension or magic header http://www.onicos.com/staff/iz/formats/gzip.html
-    if key[-3:] == ".gz" or data[:2] == b"\x1f\x8b":
-        with gzip.GzipFile(fileobj=BytesIO(data)) as decompress_stream:
-            # Reading line by line avoid a bug where gzip would take a very long time (>5min) for
-            # file around 60MB gzipped
-            data = b"".join(BufferedReader(decompress_stream))
 
     if is_cloudtrail(str(key)):
         cloud_trail = json.loads(data)
@@ -197,10 +239,10 @@ def s3_handler(event, context, metadata):
                 event, {"aws": {"s3": {"bucket": bucket, "key": key}}}
             )
             yield structured_line
+
     else:
         # Check if using multiline log regex pattern
         # and determine whether line or pattern separated logs
-        data = data.decode("utf-8", errors="ignore")
         if DD_MULTILINE_LOG_REGEX_PATTERN and multiline_regex_start_pattern.match(data):
             split_data = multiline_regex.split(data)
         else:
@@ -215,6 +257,31 @@ def s3_handler(event, context, metadata):
             }
             yield structured_line
 
+##
+# Break up s3 files that firehose delivers with concatenated json documents
+# https://stackoverflow.com/questions/34468319/reading-the-data-written-to-s3-by-amazon-kinesis-firehose-stream/49417680#49417680
+##
+def split_json(content, firstOnly=False):
+    json_array = []
+    decoder = json.JSONDecoder()
+    content_length = len(content)
+    decode_index = 0
+
+    while decode_index < content_length:
+        try:
+            obj, decode_index = decoder.raw_decode(content, decode_index)
+            logger.debug("JSON object ends at index:" + str(decode_index))
+            ## Ignore anything that's not a data message
+            if 'messageType' in obj and obj["messageType"] != "DATA_MESSAGE":
+                continue
+            json_array.append(obj)
+            if firstOnly:
+                break
+        except JSONDecodeError as e:
+            logger.debug("JSONDecodeError:", e)
+            # Scan forward and keep trying to decode
+            decode_index += 1
+    return json_array
 
 def get_service_from_tags(metadata):
     # Get service from dd_custom_tags if it exists
@@ -313,6 +380,21 @@ def is_cloudtrail(key):
     match = cloudtrail_regex.search(key)
     return bool(match)
 
+def is_firehose_log(data):
+    if not DD_FIREHOSE_SUBSCRIPTIONS:
+        return False
+
+    json_array = split_json(data, True)
+    if not json_array:
+        return False
+
+    filters = DD_FIREHOSE_SUBSCRIPTIONS.split(':')
+    if 'subscriptionFilters' in json_array[0]:
+        for e in json_array[0]["subscriptionFilters"]:
+            if e in filters:
+                return True
+
+    return False
 
 def find_s3_source(key):
     # e.g. AWSLogs/123456779121/elasticloadbalancing/us-east-1/2020/10/02/123456779121_elasticloadbalancing_us-east-1_app.alb.xxxxx.xx.xxx.xxx_x.log.gz
@@ -428,13 +510,7 @@ def parse_service_arn(source, key, bucket, context):
 
 # Handle CloudWatch logs
 def awslogs_handler(event, context, metadata):
-    # Get logs
-    with gzip.GzipFile(
-        fileobj=BytesIO(base64.b64decode(event["awslogs"]["data"]))
-    ) as decompress_stream:
-        # Reading line by line avoid a bug where gzip would take a very long
-        # time (>5min) for file around 60MB gzipped
-        data = b"".join(BufferedReader(decompress_stream))
+    data = unzipData(base64.b64decode(event["awslogs"]["data"]))
     logs = json.loads(data)
 
     # Set the source on the logs
@@ -481,9 +557,13 @@ def awslogs_handler(event, context, metadata):
         if len(log_group_parts) > 1:
             lowercase_function_name = log_group_parts[1].lower()
             # Split the arn of the forwarder to extract the prefix
+            # This only works if the forwarder is running in the same account as the lambda - not true for firehose
+            # which could be in different account (but same region)
             arn_parts = context.invoked_function_arn.split("function:")
             if len(arn_parts) > 0:
                 arn_prefix = arn_parts[0]
+                app = arn_prefix.split(":")
+                arn_prefix = app[0] + ":" + app[1] + ":" + app[2] + ":" + app[3] + ":" + logs["owner"] + ":"
                 # Rebuild the arn with the lowercased function name
                 lowercase_arn = arn_prefix + "function:" + lowercase_function_name
                 # Add the lowercased arn as a log attribute
@@ -510,8 +590,15 @@ def awslogs_handler(event, context, metadata):
 
     # Create and send structured logs to Datadog
     for log in logs["logEvents"]:
+        if DD_LOG_REDACT_REGEX is not None:
+            log["message"] = redact_log_message(log["message"])
         yield merge_dicts(log, aws_attributes)
 
+def redact_log_message(message):
+    parts = log_redact_regex.split(message, 2)
+    if len(parts) > 1:
+        message=parts[1] + " " + DD_LOG_REDACT_REPLACEMENT
+    return message
 
 def merge_dicts(a, b, path=None):
     if path is None:
@@ -729,6 +816,20 @@ def kinesis_awslogs_handler(event, context, metadata):
     return itertools.chain.from_iterable(
         awslogs_handler(reformat_record(r), context, metadata) for r in event["Records"]
     )
+
+def firehose_awslogs_handler(event, context, metadata, data):
+    json_array = split_json(data)
+    def reformat_record(record):
+        b64bytes = base64.b64encode(json.dumps(record).encode("utf-8"))
+        b64message = b64bytes.decode("utf-8")
+        json_text = '{"awslogs":{"data":"' + b64message + '"}}'
+        return json.loads(json_text)
+
+    return itertools.chain.from_iterable(
+        awslogs_handler(reformat_record(r), context, metadata) for r in json_array
+    )
+
+
 
 
 def normalize_events(events, metadata):

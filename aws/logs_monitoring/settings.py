@@ -217,6 +217,10 @@ DD_MULTILINE_LOG_REGEX_PATTERN = get_env_var(
     "DD_MULTILINE_LOG_REGEX_PATTERN", default=None
 )
 
+DD_LOG_REDACT_REGEX = get_env_var("DD_LOG_REDACT_REGEX", default=None)
+DD_LOG_REDACT_REPLACEMENT = get_env_var("DD_LOG_REDACT_REPLACEMENT", default="Log redacted")
+DD_FIREHOSE_SUBSCRIPTIONS = get_env_var("DD_FIREHOSE_SUBSCRIPTIONS", default=None)
+
 DD_SOURCE = "ddsource"
 DD_CUSTOM_TAGS = "ddtags"
 DD_SERVICE = "service"
@@ -227,8 +231,12 @@ DD_FORWARDER_VERSION = "3.39.0"
 DD_ADDITIONAL_TARGET_LAMBDAS = get_env_var("DD_ADDITIONAL_TARGET_LAMBDAS", default=None)
 
 DD_S3_BUCKET_NAME = get_env_var("DD_S3_BUCKET_NAME", default=None)
-DD_S3_CACHE_FILENAME = "cache.json"
-DD_S3_CACHE_LOCK_FILENAME = "cache.lock"
+DD_S3_CACHE_FILENAME = "cache_{}.json"
+DD_S3_CACHE_LOCK_FILENAME = "cache_{}.lock"
 
 DD_TAGS_CACHE_TTL_SECONDS = int(get_env_var("DD_TAGS_CACHE_TTL_SECONDS", default=300))
 DD_S3_CACHE_LOCK_TTL_SECONDS = 60
+
+DD_GET_TAGS_ROLENAME = get_env_var("DD_GET_TAGS_ROLENAME", default="")
+# Holds 'this' account
+DD_MY_ACCOUNT = ""

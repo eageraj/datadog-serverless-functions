@@ -22,6 +22,8 @@ from settings import (
     DD_TAGS_CACHE_TTL_SECONDS,
     DD_S3_CACHE_LOCK_FILENAME,
     DD_S3_CACHE_LOCK_TTL_SECONDS,
+    DD_GET_TAGS_ROLENAME,
+    DD_MY_ACCOUNT,
 )
 from telemetry import (
     DD_FORWARDER_TELEMETRY_NAMESPACE_PREFIX,
@@ -97,12 +99,16 @@ METRIC_ADJUSTMENT_FACTORS = {
     INIT_DURATION_METRIC_NAME: 0.001,
 }
 
-
-resource_tagging_client = boto3.client("resourcegroupstaggingapi")
 s3_client = boto3.resource("s3")
+resource_tagging_client = boto3.client("resourcegroupstaggingapi")
+sts_client=boto3.client('sts')
 
 logger = logging.getLogger()
 
+if DD_GET_TAGS_ROLENAME:
+    logger.debug("Using role " + DD_GET_TAGS_ROLENAME + " for reading cross account tags")
+else:
+    logger.warning("No role specified for reading cross account tags. Cross account tags will not be fetched")
 
 try:
     from datadog_lambda.metric import lambda_stats
@@ -123,7 +129,7 @@ class LambdaTagsCache(object):
         self.tags_by_arn = {}
         self.last_tags_fetch_time = 0
 
-    def _refresh(self):
+    def _refresh(self, resource_arn):
         """Populate the tags in the local cache by getting cache from s3
         If cache not in s3, then cache is built using GetResources
         """
@@ -136,7 +142,12 @@ class LambdaTagsCache(object):
             )
             return
 
-        tags_fetched, last_modified = get_cache_from_s3()
+        account_number = get_account_number(resource_arn)
+        if not account_number:
+            logger.debug("Not fetching custom tags because could not get account number from {}".format(resource_arn))
+            return
+
+        tags_fetched, last_modified = get_cache_from_s3(account_number)
 
         # s3 cache fetch succeeded
         if last_modified > -1:
@@ -147,14 +158,14 @@ class LambdaTagsCache(object):
             logger.debug(
                 "S3 cache expired, building cache from Resource Groups Tagging API"
             )
-            lock_acquired = acquire_s3_cache_lock()
+            lock_acquired = acquire_s3_cache_lock(account_number)
             if lock_acquired:
-                success, tags_fetched = build_tags_by_arn_cache()
+                success, tags_fetched = assume_role_and_build_tags_by_arn_cache(resource_arn)
                 if success:
                     self.tags_by_arn = tags_fetched
-                    write_cache_to_s3(self.tags_by_arn)
+                    write_cache_to_s3(self.tags_by_arn, account_number)
 
-                release_s3_cache_lock()
+                release_s3_cache_lock(account_number)
 
     def _is_expired(self, last_modified=None):
         """Returns bool for whether the fetch TTL has expired"""
@@ -181,7 +192,7 @@ class LambdaTagsCache(object):
         if self._is_expired():
             send_forwarder_internal_metrics("local_cache_expired")
             logger.debug("Local cache expired, fetching cache from S3")
-            self._refresh()
+            self._refresh(resource_arn)
 
         function_tags = self.tags_by_arn.get(resource_arn, [])
         return function_tags
@@ -189,7 +200,7 @@ class LambdaTagsCache(object):
 
 # Store the cache in the global scope so that it will be reused as long as
 # the log forwarder Lambda container is running
-account_lambda_tags_cache = LambdaTagsCache()
+account_lambda_tags_cache = dict()
 
 
 class DatadogMetricPoint(object):
@@ -346,9 +357,9 @@ def get_last_modified_time(s3_file):
     return last_modified_unix_time
 
 
-def acquire_s3_cache_lock():
+def acquire_s3_cache_lock(account_number):
     """Acquire cache lock"""
-    cache_lock_object = s3_client.Object(DD_S3_BUCKET_NAME, DD_S3_CACHE_LOCK_FILENAME)
+    cache_lock_object = s3_client.Object(DD_S3_BUCKET_NAME, get_lock_filename(account_number))
     try:
         file_content = cache_lock_object.get()
 
@@ -370,12 +381,17 @@ def acquire_s3_cache_lock():
 
     return True
 
+def get_lock_filename(account_number):
+    return DD_S3_CACHE_LOCK_FILENAME.replace('{}', account_number)
 
-def release_s3_cache_lock():
+def get_cache_filename(account_number):
+    return DD_S3_CACHE_FILENAME.replace('{}', account_number)
+
+def release_s3_cache_lock(account_number):
     """Release cache lock"""
     try:
         cache_lock_object = s3_client.Object(
-            DD_S3_BUCKET_NAME, DD_S3_CACHE_LOCK_FILENAME
+            DD_S3_BUCKET_NAME, get_lock_filename(account_number)
         )
         cache_lock_object.delete()
         send_forwarder_internal_metrics("s3_cache_lock_released")
@@ -385,20 +401,22 @@ def release_s3_cache_lock():
         logger.debug("Unable to release S3 cache lock", exc_info=True)
 
 
-def write_cache_to_s3(data):
+def write_cache_to_s3(data, account_number):
     """Writes tags cache to s3"""
+    logger.debug("Writing S3 tags cache for {}".format(account_number))
     try:
-        s3_object = s3_client.Object(DD_S3_BUCKET_NAME, DD_S3_CACHE_FILENAME)
+        s3_object = s3_client.Object(DD_S3_BUCKET_NAME, get_cache_filename(account_number))
         s3_object.put(Body=(bytes(json.dumps(data).encode("UTF-8"))))
     except ClientError:
         send_forwarder_internal_metrics("s3_cache_write_failure")
         logger.debug("Unable to write new cache to S3", exc_info=True)
 
 
-def get_cache_from_s3():
+def get_cache_from_s3(account_number):
     """Retrieves tags cache from s3 and returns the body along with
     the last modified datetime for the cache"""
-    cache_object = s3_client.Object(DD_S3_BUCKET_NAME, DD_S3_CACHE_FILENAME)
+    logger.debug("Fetching s3 cache for {}".format(account_number))
+    cache_object = s3_client.Object(DD_S3_BUCKET_NAME, get_cache_filename(account_number))
     try:
         file_content = cache_object.get()
         tags_cache = json.loads(file_content["Body"].read().decode("utf-8"))
@@ -421,6 +439,7 @@ def build_tags_by_arn_cache():
     """
     tags_fetch_success = False
     tags_by_arn_cache = {}
+
     get_resources_paginator = resource_tagging_client.get_paginator("get_resources")
 
     try:
@@ -462,9 +481,7 @@ def parse_and_submit_enhanced_metrics(logs):
 
     for log in logs:
         try:
-            enhanced_metrics = generate_enhanced_lambda_metrics(
-                log, account_lambda_tags_cache
-            )
+            enhanced_metrics = generate_enhanced_lambda_metrics(log, account_lambda_tags_cache)
             for enhanced_metric in enhanced_metrics:
                 enhanced_metric.submit_to_dd()
         except Exception:
@@ -474,7 +491,7 @@ def parse_and_submit_enhanced_metrics(logs):
             )
 
 
-def generate_enhanced_lambda_metrics(log, tags_cache):
+def generate_enhanced_lambda_metrics(log, account_tags_cache):
     """Parses a Lambda log for enhanced Lambda metrics and tags
 
     Args:
@@ -508,8 +525,15 @@ def generate_enhanced_lambda_metrics(log, tags_cache):
     """
     # Note: this arn attribute is always lowercased when it's created
     log_function_arn = log.get("lambda", {}).get("arn")
+    account_number = get_account_number(log_function_arn)
     log_message = log.get("message")
     timestamp = log.get("timestamp")
+
+    if not account_number:
+        return []
+
+    if account_number not in account_tags_cache:
+        account_tags_cache[account_number] = LambdaTagsCache()
 
     is_lambda_log = all((log_function_arn, log_message, timestamp))
     if not is_lambda_log:
@@ -532,7 +556,7 @@ def generate_enhanced_lambda_metrics(log, tags_cache):
 
     # Add the tags from ARN, custom tags cache, and env var
     tags_from_arn = parse_lambda_tags_from_arn(log_function_arn)
-    lambda_custom_tags = tags_cache.get(log_function_arn)
+    lambda_custom_tags = account_tags_cache[account_number].get(log_function_arn)
 
     for parsed_metric in parsed_metrics:
         parsed_metric.add_tags(tags_from_arn + lambda_custom_tags)
@@ -565,7 +589,6 @@ def parse_lambda_tags_from_arn(arn):
         "aws_account:{}".format(account_id),
         "functionname:{}".format(function_name),
     ]
-
 
 def parse_metrics_from_report_log(report_log_line):
     """Parses and returns metrics from the REPORT Lambda log
@@ -654,7 +677,14 @@ def get_enriched_lambda_log_tags(log_event):
     if not log_function_arn:
         return []
     tags_from_arn = parse_lambda_tags_from_arn(log_function_arn)
-    lambda_custom_tags = account_lambda_tags_cache.get(log_function_arn)
+
+    account_number = get_account_number(log_function_arn)
+    if not account_number:
+        return []
+    if account_number not in account_lambda_tags_cache:
+        account_lambda_tags_cache[account_number] = LambdaTagsCache()
+
+    lambda_custom_tags = account_lambda_tags_cache[account_number].get(log_function_arn)
 
     # Combine and dedup tags
     tags = list(set(tags_from_arn + lambda_custom_tags))
@@ -706,3 +736,54 @@ def create_out_of_memory_enhanced_metric(log_line):
         1.0,
     )
     return [dd_metric]
+
+def get_account_number(arn):
+    # Extract the account number
+    ## arn:aws:lambda:ap-southeast-2:295788293716:function:test-function
+    if not arn:
+        return None
+
+    parts = arn.split(":")
+    if len(parts) > 4:
+        return parts[4]
+    logger.warning("Unable to retrieve account number from {}".format(arn))
+    return None
+
+## Assume role for the account number in the passed arn
+def assume_role_and_build_tags_by_arn_cache(arn):
+    global DD_MY_ACCOUNT
+    # It probably helps caching to keep these global??
+    global resource_tagging_client
+    global sts_client
+
+    account = get_account_number(arn)
+
+    if not account:
+        return False, {}
+
+    if not DD_GET_TAGS_ROLENAME and account != DD_MY_ACCOUNT:
+        logger.debug("No cross account role specified. Not fetching tags for account " + arn)
+        return False, {}
+
+    if account == DD_MY_ACCOUNT:
+        logger.debug("Using boto client")
+
+    else:
+        sts_client=boto3.client('sts')
+        roleName = 'arn:aws:iam::' + account + ':role/' + DD_GET_TAGS_ROLENAME
+        roleSessionName = "AssumeRoleSessionAccount-" + account
+
+        try:
+            logger.debug("Using STS to assume role for client {}".format(account))
+            assumed_role_object=sts_client.assume_role(RoleArn=roleName, RoleSessionName=roleSessionName)
+            credentials=assumed_role_object['Credentials']
+        except ClientError as e:
+            logger.error("Unable to assume role '" + roleName + "': " + str(e))
+            return False, {}
+
+        resource_tagging_client = boto3.client("resourcegroupstaggingapi"
+                                               , aws_access_key_id=credentials['AccessKeyId']
+                                               , aws_secret_access_key=credentials['SecretAccessKey']
+                                               , aws_session_token=credentials['SessionToken'])
+
+    return build_tags_by_arn_cache()
